@@ -138,6 +138,7 @@ static int __init simple_init(void)
 
 static void __exit simple_exit(void)
 {
+	printk(KERN_INFO "Unloading netfilter... \n");
 	//nf_unregister_hook(&my_nf_ops);
 
 	proc_remove(proc_file_add);
@@ -145,5 +146,14 @@ static void __exit simple_exit(void)
 	proc_remove(proc_file_show);
 	proc_remove(proc_dir);
 
+	printk(KERN_INFO "\tSuccessfully removed!\n");
 	return;
 }
+
+module_init(simple_init);
+module_exit(simple_exit);
+
+MODULE_AUTHOR("Hyokyung, Jiseongg");
+MODULE_DESCRIPTION("File system profiling module");
+MODULE_LICENSE("GPL");
+MODULE_VERSION("NEW");
