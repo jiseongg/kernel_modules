@@ -32,22 +32,22 @@ static struct proc_dir_entry *proc_file_show;
 //int P_ports[10];
 //int F_ports[10]; //first design
 
-static enum rule_type {
+typedef enum {
 	RINVAL = -1,
 	INBOUND,
 	OUTBOUND,
 	FORWARD,
 	PROXY,
-};
+} rule_type;
 
-static struct nf_rule {
-	enum rule_type rule;
+typedef struct _nf_rule {
+	rule_type rule;
 	unsigned short s_port;
-};
+} nf_rule;
 
 #define MAX_RULE 30
-static struct nf_rule rules[MAX_RULE];
-static char rule_str[MAX_RULE][20];
+static nf_rule rules[MAX_RULE];
+static char rules_str[MAX_RULE][20];
 static int head = -1, tail = -1, rule_cnt = 0;
 
 /** rules 돌면서 뭔짓 할 때 아래처럼 돌면 됨.
@@ -63,7 +63,7 @@ static int head = -1, tail = -1, rule_cnt = 0;
  */
 
 // e.g. 'F' -> FORWARD( == 0)
-static int rule_num(char c)
+static rule_type rule_num(char c)
 {
 	// case-insensitive match
 	switch(c) {
@@ -136,31 +136,32 @@ static struct nf_hook_ops my_nf_ops = {
  */
 static int my_open(struct inode *inode, struct file *file)
 {
-	printk(KERN_INFO "OPEN /proc/%s/%s\n",
-			PROC_DIR,
+	printk(KERN_INFO "proc file open: %s.\n",
 			file->f_path.dentry->d_name.name);
 	return 0;
 }
 
+// /proc/group3/add
 static ssize_t rule_add(struct file *file,
 		const char __user *user_buffer,
 		size_t count,
 		loff_t *ppos) 
 {
 	char buf[ADDBUF_SZ];
-	int rule;
 	unsigned short port_num;
-	ssize_t ret;
+	rule_type rule;
 
-	if((ret = copy_from_user(buf, user_buffer, ADDBUF_SZ))) {
+	if (copy_from_user(buf, user_buffer, ADDBUF_SZ)) {
 		return -EFAULT;
 	}
 
+	// extract rule type and port number from user input
 	rule = rule_num(buf[0]);
 	sscanf(&buf[2], "%hu\n", &port_num);
 	
-	if ((tail + 1) % MAX_RULE == head) {
-		printk(KERN_INFO "/proc/group3/add: the number of rules reaches max\n");
+	if (rule_cnt == MAX_RULE) {
+		printk(KERN_INFO "proc file err: add: the number of rules reaches max.\n");
+		return -EINVAL;
 	} else {
 		tail = (tail + 1) % MAX_RULE;
 		rules[tail].rule = rule;
@@ -179,11 +180,36 @@ static const struct file_operations add_fops = {
 	.write = rule_add
 };
 
+// /proc/group3/del
 static ssize_t rule_del(struct file *file,
 		const char __user *user_buffer,
 		size_t count,
 		loff_t *ppos) 
 {
+	char buf[DELBUF_SZ];
+	int del_idx, idx, prev;
+
+	if (copy_from_user(buf, user_buffer, DELBUF_SZ)) {
+		return -EFAULT;
+	}
+
+	// extract target rule index to delete, from user input
+	sscanf(&buf[0], "%d\n", &del_idx);
+	
+	if (del_idx >= rule_cnt || del_idx < 0) {
+		printk(KERN_INFO "proc file err: no rule with index %d.\n", del_idx);
+		return -EINVAL;
+	}
+
+	idx = (head + del_idx) % MAX_RULE;
+	while (idx != head) {
+		prev = (idx == 0) ? MAX_RULE - 1 : idx - 1;
+		rules[idx] = rules[prev];
+		idx = prev;
+	}
+	head = (head + 1) % MAX_RULE;
+	rule_cnt--;
+
 	return count;
 }
 
@@ -201,22 +227,20 @@ static ssize_t rule_show(struct file *file,
 	int idx, i;
 	ssize_t ret, cnt;
 
-	if(head == -1 || tail == (head + 1) % MAX_RULE) {
-		printk(KERN_INFO "/proc/group3/show: no rules defined\n");
-		return -EINVAL;
-	}
+	// initialize `rules_str` buffer
+	cnt = sizeof(rules_str);
+	memset(rules_str, 0, cnt);
 
-	// string representation of rule lists
-	for(idx = head, i = 0; i < rule_cnt; i++) {
-		sprintf(rule_str[idx],
+	// save string representation of `rules` to `rules_str`
+	for (idx = head, i = 0; i < rule_cnt; i++) {
+		sprintf(rules_str[i],
 				"%2d: %8s  %5hu\n",
 				i, rule_name(rules[idx].rule), rules[idx].s_port);
 		idx = (idx + 1) % MAX_RULE;
 	}
 	
-	cnt = sizeof(rule_str);
 	// ret == `amount of bytes not copyed`
-	ret = copy_to_user(user_buffer, rule_str, cnt);
+	ret = copy_to_user(user_buffer, rules_str, cnt);
 	*ppos += cnt - ret;
 	if (*ppos > cnt){
 		return 0;
