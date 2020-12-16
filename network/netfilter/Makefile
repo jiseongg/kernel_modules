@@ -1,7 +1,6 @@
 obj-m += netfilter.o
 
 all: check-kdir
-	$(error)
 	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) modules
 
 clean:

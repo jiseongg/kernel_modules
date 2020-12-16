@@ -6,7 +6,9 @@
 #include <linux/netfilter.h>
 #include <linux/proc_fs.h>
 #include <linux/tcp.h>
+#include <linux/byteorder/generic.h>
 #include <uapi/linux/netfilter_ipv4.h>
+#include <linux/string.h>
 
 #define PROC_DIR "group3"
 #define RULE_ADD "add"
@@ -17,21 +19,17 @@ static struct proc_dir_entry *proc_file_add;
 static struct proc_dir_entry *proc_file_del;
 static struct proc_dir_entry *proc_file_show;
 
-#define ADDBUF_SZ 10  // used in rule_add function
-#define DELBUF_SZ 5		// used in rule_del function
+int idx, i;
 
-//일단 가장 처음 echo 1 > /rpoc/sys/net/ipv4/ip_forward=1로 키기 
+#define ADDBUF_SZ 10  // used in rule_add function
+#define DELBUF_SZ 5   // used in rule_del function
+#define SERV_ADDR "192.168.56.4" //used in netfilter hook functions
+
 
 /** rule data structures
- * author: Hyokyung, Jiseong
+ * author: Jiseong
  * date: 2020.12.09
  */
-
-//int I_ports[10]; 
-//int O_ports[10];
-//int P_ports[10];
-//int F_ports[10]; //first design
-
 typedef enum {
 	RINVAL = -1,
 	INBOUND,
@@ -50,19 +48,7 @@ static nf_rule rules[MAX_RULE];
 static char rules_str[MAX_RULE][20];
 static int head = -1, tail = -1, rule_cnt = 0;
 
-/** rules 돌면서 뭔짓 할 때 아래처럼 돌면 됨.
- * enqueue, dequeue 함수까지 엄밀하게 만들기는
- * 좀 가성비 안 좋은 것 같아서 안 만들었음.
- * 
- * 	int idx, i;
- *  for(idx = head, i = 0; i < rule_cnt; i++) {
- *
- *		// do something
- *  	idx = (idx + 1) % MAX_RULE;
- *  }
- */
-
-// e.g. 'F' -> FORWARD( == 0)
+// e.g. 'F' -> FORWARD( == 2)
 static rule_type rule_num(char c)
 {
 	// case-insensitive match
@@ -101,32 +87,191 @@ static const char* rule_name(int n)
 	}
 }
 
-//I: NF_INET_PRE_ROUTING에서, inbound 통과는 아래 함수
-//O: NF_INET_POST_ROUTING에서, O_ports 있으면 통과/drop
-//F: NF_INET_FORWARD에서, F_ports 있으면 주소 바꾸기 
-//P: NF_INET_PRE_ROUTING에서, proxy는 skb접근해서 ip주소 바꾸기
 
-//inbound drop hook function
-static unsigned int my_hook_accept_fn(void *priv, struct sk_buff *skb, const struct nf_hook_state * state){
+// ip manipulation
+unsigned int as_addr_to_net(char *str)
+{
+	unsigned char arr[4];
+	sscanf(str, "%d.%d.%d.%d", &arr[0],&arr[1],&arr[2],&arr[3]);
+	return *(unsigned int*)arr;
+}
+
+char *as_net_to_addr(unsigned int addr,char str[])
+{
+	char add[16];
+	unsigned char a = ((unsigned char*)&addr)[0];
+	unsigned char b = ((unsigned char*)&addr)[1];
+	unsigned char c = ((unsigned char*)&addr)[2];
+	unsigned char d = ((unsigned char*)&addr)[3];
+	sprintf(add, "%u.%u.%u.%u", a,b,c,d);
+	sprintf(str, "%s", add);
+	return str;
+}
+
+/** netfilter hook functions
+ * author: Hyokyung
+ * date: 2020.12.11
+ */
+// inbound drop hook function
+static unsigned int my_hook_inbound_fn(void *priv, struct sk_buff *skb, const struct nf_hook_state * state){
+	int proxy_check = 0;
 	struct iphdr *ih = ip_hdr(skb);
 	struct tcphdr *th = tcp_hdr(skb);
-	unsigned int saddr = ih->saddr;
-	unsigned int daddr = ih->daddr;
-	unsigned int sport = th->source;
-	unsigned int dport = th->dest;
+	int saddr_ = ih->saddr;
+	int daddr_ = ih->daddr;
+	char tmp1[16], tmp2[16];
+	char* saddr = as_net_to_addr(saddr_,tmp1);
+	char* daddr = as_net_to_addr(daddr_,tmp2);
+	u16 sport, dport;
+	sport = ntohs(th->source);
+	dport = ntohs(th->dest);
+	if (!strcmp(saddr, SERV_ADDR)){
+	 	for(idx = head, i = 0; i < rule_cnt; i++) {
+	 		if (proxy_check == 0 &&
+	 			rules[idx].rule == PROXY && rules[idx].s_port == sport)
+	 			proxy_check = 1;
 
-	//만약 I_ports에 dport가 있으면 return NF_DROP;
-	//맞게 printk 문해서 dmesg 출력
+			if (rules[idx].rule == INBOUND && rules[idx].s_port == sport){
+				printk(KERN_ALERT "%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n",
+						"DROP(INBOUND)", ih->protocol, sport, dport, saddr, daddr,
+						th->syn, th->fin, th->ack, th->rst);
+				return NF_DROP;
+			}
+			idx = (idx + 1) % MAX_RULE;
+		}
+		/** if proxy rule exists for this port,
+		 * my_hook_proxy_fn will print the log
+		 */
+		if (proxy_check == 0){
+			printk(KERN_ALERT"%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n",
+					"INBOUND", ih->protocol, sport, dport, saddr, daddr,
+					th->syn, th->fin, th->ack, th->rst);
+		}
+	}
 	return NF_ACCEPT;
 }
 
-//이걸 inbound, outbound, forward, proxy 마다 만들면 될듯
-//이건 inbound용
-static struct nf_hook_ops my_nf_ops = {
-	.hook = my_hook_accept_fn,
+// forward drop hook function
+static unsigned int my_hook_forward_fn(void *priv, struct sk_buff *skb, const struct nf_hook_state * state){
+	struct iphdr *ih = ip_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
+	int saddr_ = ih->saddr;
+	int daddr_ = ih->daddr;
+	char tmp1[16], tmp2[16];
+	char* saddr = as_net_to_addr(saddr_,tmp1);
+	char* daddr = as_net_to_addr(daddr_,tmp2);
+	u16 sport, dport;
+	sport = ntohs(th->source);
+	dport = ntohs(th->dest);
+	if (!strcmp(saddr, SERV_ADDR)){
+	 	for(idx = head, i = 0; i < rule_cnt; i++) {
+			if (rules[idx].rule == FORWARD && rules[idx].s_port == sport){
+				printk(KERN_ALERT "%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n", 
+						"DROP(FORWARD)", ih->protocol, sport, dport, saddr, daddr,
+						th->syn, th->fin, th->ack, th->rst);
+				return NF_DROP;
+			}
+			idx = (idx + 1) % MAX_RULE;
+		}
+		printk(KERN_ALERT "%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n", 
+				"FORWARD", ih->protocol, sport, dport, saddr, daddr,
+				th->syn, th->fin, th->ack, th->rst);
+	}
+	return NF_ACCEPT;
+}
+
+// outbound drop hook function
+static unsigned int my_hook_outbound_fn(void *priv, struct sk_buff *skb, const struct nf_hook_state * state){
+	struct iphdr *ih = ip_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
+	int saddr_ = ih->saddr;
+	int daddr_ = ih->daddr;
+	char tmp1[16], tmp2[16];
+	char* saddr = as_net_to_addr(saddr_,tmp1);
+	char* daddr = as_net_to_addr(daddr_,tmp2);
+	u16 sport, dport;
+	sport = ntohs(th->source);
+	dport = ntohs(th->dest);
+	if (!strcmp(daddr, SERV_ADDR)){
+	 	for(idx = head, i = 0; i < rule_cnt; i++) {
+			if (rules[idx].rule == OUTBOUND && rules[idx].s_port == dport){
+				printk(KERN_ALERT "%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n", 
+						"DROP(OUTBOUND)", ih->protocol, sport, dport, saddr, daddr,
+						th->syn, th->fin, th->ack, th->rst);
+				return NF_DROP;
+			}
+			idx = (idx + 1) % MAX_RULE;
+		}
+		printk(KERN_ALERT "%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n",
+				"OUTBOUND", ih->protocol, sport, dport, saddr, daddr,
+				th->syn, th->fin, th->ack, th->rst);
+	}
+	return NF_ACCEPT;
+}
+
+// proxy hook function
+static unsigned int my_hook_proxy_fn(void *priv, struct sk_buff *skb, const struct nf_hook_state * state){
+	struct iphdr *ih = ip_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
+	int saddr_ = ih->saddr;
+	int daddr_ = ih->daddr;
+	char tmp1[16], tmp2[16];
+	char* saddr = as_net_to_addr(saddr_,tmp1);
+	char* daddr = as_net_to_addr(daddr_,tmp2);
+	u16 sport, dport;
+	sport = ntohs(th->source);
+	dport = ntohs(th->dest);
+	if (!strcmp(saddr, SERV_ADDR)){
+	 	for(idx = head, i = 0; i < rule_cnt; i++) {
+			if (rules[idx].rule == PROXY && rules[idx].s_port == sport){
+				ih->daddr= as_addr_to_net("131.1.1.1");
+				th->dest = sport;
+				saddr = as_net_to_addr(ih->saddr,tmp1);
+				daddr = as_net_to_addr(ih->daddr,tmp2);
+				sport = ntohs(th->source);
+				dport = ntohs(th->dest);
+				printk(KERN_ALERT"%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n",
+						"PROXY(INBOUND)", ih->protocol, sport, dport, saddr, daddr,
+						th->syn, th->fin, th->ack, th->rst);
+				return NF_ACCEPT;
+			}
+			idx = (idx + 1) % MAX_RULE;
+		}
+	}
+	return NF_ACCEPT;
+}
+
+/** structures for hooking point
+ * author: Hyokyung
+ * date: 2020.12.11
+ */
+// inbound
+static struct nf_hook_ops my_nf_i_ops = {
+	.hook = my_hook_inbound_fn,
 	.pf = PF_INET,
 	.hooknum = NF_INET_PRE_ROUTING,
 	.priority = NF_IP_PRI_FILTER
+};
+// forward
+static struct nf_hook_ops my_nf_f_ops = {
+	.hook = my_hook_forward_fn,
+	.pf = PF_INET,
+	.hooknum = NF_INET_FORWARD,
+	.priority = NF_IP_PRI_FILTER
+};
+// outbound
+static struct nf_hook_ops my_nf_o_ops = {
+	.hook = my_hook_outbound_fn,
+	.pf = PF_INET,
+	.hooknum = NF_INET_POST_ROUTING,
+	.priority = NF_IP_PRI_FILTER
+};
+// proxy
+static struct nf_hook_ops my_nf_p_ops = {
+	.hook = my_hook_proxy_fn,
+	.pf = PF_INET,
+	.hooknum = NF_INET_PRE_ROUTING,
+	.priority = NF_IP_PRI_FILTER+1
 };
 
 
@@ -134,6 +279,7 @@ static struct nf_hook_ops my_nf_ops = {
  * author: Jiseong
  * date: 2020.12.10 ~ 2020.12.11
  */
+// open: common function
 static int my_open(struct inode *inode, struct file *file)
 {
 	printk(KERN_INFO "proc file open: %s.\n",
@@ -141,7 +287,7 @@ static int my_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-// /proc/group3/add
+// write to /proc/group3/add
 static ssize_t rule_add(struct file *file,
 		const char __user *user_buffer,
 		size_t count,
@@ -174,13 +320,7 @@ static ssize_t rule_add(struct file *file,
 	return count;
 }
 
-static const struct file_operations add_fops = {
-	.owner = THIS_MODULE,
-	.open = my_open,
-	.write = rule_add
-};
-
-// /proc/group3/del
+// write to /proc/group3/del
 static ssize_t rule_del(struct file *file,
 		const char __user *user_buffer,
 		size_t count,
@@ -213,12 +353,7 @@ static ssize_t rule_del(struct file *file,
 	return count;
 }
 
-static const struct file_operations del_fops = {
-	.owner = THIS_MODULE,
-	.open = my_open,
-	.write = rule_del
-};
-
+// read from /proc/group3/show
 static ssize_t rule_show(struct file *file,
 		char __user *user_buffer,
 		size_t len,
@@ -249,6 +384,25 @@ static ssize_t rule_show(struct file *file,
 	}
 }
 
+/** operations for procfs entry
+ * author: Jiseong
+ * date: 2020.12.10 ~ 2020.12.11
+ */
+// /proc/group3/add
+static const struct file_operations add_fops = {
+	.owner = THIS_MODULE,
+	.open = my_open,
+	.write = rule_add
+};
+
+// /proc/group3/del
+static const struct file_operations del_fops = {
+	.owner = THIS_MODULE,
+	.open = my_open,
+	.write = rule_del
+};
+
+// /proc/group3/show
 static const struct file_operations show_fops = {
 	.owner = THIS_MODULE,
 	.open = my_open,
@@ -264,7 +418,10 @@ static int __init simple_init(void)
 	proc_file_del = proc_create(RULE_DEL, 0600, proc_dir, &del_fops);
 	proc_file_show = proc_create(RULE_SHOW, 0600, proc_dir, &show_fops);
 
-	//nf_register_hook(&my_nf_hops);
+	nf_register_hook(&my_nf_i_ops);
+	nf_register_hook(&my_nf_f_ops);
+	nf_register_hook(&my_nf_o_ops);
+	nf_register_hook(&my_nf_p_ops);
 	
 	return 0;
 }
@@ -274,7 +431,10 @@ static void __exit simple_exit(void)
 	printk(KERN_INFO "==========================\n");
 	printk(KERN_INFO "Unloading netfilter... \n");
 
-	//nf_unregister_hook(&my_nf_ops);
+	nf_unregister_hook(&my_nf_i_ops);
+	nf_unregister_hook(&my_nf_f_ops);
+	nf_unregister_hook(&my_nf_o_ops);
+	nf_unregister_hook(&my_nf_p_ops);
 
 	proc_remove(proc_file_add);
 	proc_remove(proc_file_del);
