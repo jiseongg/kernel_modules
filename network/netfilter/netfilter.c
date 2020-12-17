@@ -192,7 +192,7 @@ static unsigned int my_hook_outbound_fn(void *priv, struct sk_buff *skb, const s
 	u16 sport, dport;
 	sport = ntohs(th->source);
 	dport = ntohs(th->dest);
-	if (!strcmp(daddr, SERV_ADDR)){
+	if (!strcmp(daddr, SERV_ADDR) || !strcmp(saddr, SERV_ADDR)){
 	 	for(idx = head, i = 0; i < rule_cnt; i++) {
 			if (rules[idx].rule == OUTBOUND && rules[idx].s_port == dport){
 				printk(KERN_ALERT "%-15s:%2u,%5d,%5d,%-15s,%-15s,%d,%d,%d,%d\n", 
@@ -225,7 +225,7 @@ static unsigned int my_hook_proxy_fn(void *priv, struct sk_buff *skb, const stru
 	 	for(idx = head, i = 0; i < rule_cnt; i++) {
 			if (rules[idx].rule == PROXY && rules[idx].s_port == sport){
 				ih->daddr= as_addr_to_net("131.1.1.1");
-				th->dest = sport;
+				th->dest = htons(sport);
 				saddr = as_net_to_addr(ih->saddr,tmp1);
 				daddr = as_net_to_addr(ih->daddr,tmp2);
 				sport = ntohs(th->source);
