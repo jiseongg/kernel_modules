@@ -115,13 +115,8 @@ void *socket_connection(void *arg){
 	// connection
 	if(connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1)
 		error_handler("connect() error");
-	else
+	else 
 		printf("open: %hu\n", port);
-	
-	struct sockaddr_in clnt_addr;
-	int clnt_addr_sz = sizeof(clnt_addr);
-	getsockname(sock, (struct sockaddr*)&clnt_addr, &clnt_addr_sz);
-	printf("Port number: %hu\n", ntohs(clnt_addr.sin_port));
 
 	// open file to record log
 	char file_name[20];
